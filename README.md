@@ -164,3 +164,163 @@ Operario de almacén y responsables administrativos.
 ```bash
 python manage.py test
 ```
+
+## Backend en Docker
+
+El entorno virtual local revisado usa Python 3.12.9; la imagen usa la rama
+Python 3.12 sobre Debian Bookworm (el parche se actualiza con la imagen base).
+Gunicorn 26.0.0 está fijado en `requirements.txt` y carga `config.wsgi:application`.
+La [política oficial de soporte](https://github.com/benoitc/gunicorn/security/policy)
+marca 26.0.0 como soportado y 23.0.0 como no soportado. Se eligió la versión
+26.0.0 por figurar explícitamente como soportada; su
+[publicación estable](https://pypi.org/project/gunicorn/26.0.0/)
+declara compatibilidad con Python 3.12.
+Se ejecuta con UID/GID 10001, dos workers, puerto interno 8000 y logs en
+stdout/stderr. El arranque no restaura datos ni ejecuta migraciones.
+El `CMD` de la imagen ya incluye `--no-control-socket`: desactiva la interfaz
+de control opcional y evita que intente crear su socket bajo `/home/wms`,
+ya que el usuario no tiene directorio home. No requiere variables adicionales.
+Véase la [configuración oficial del socket de control](https://gunicorn.org/reference/settings/#control-socket-disable).
+Supabase Auth y la validación JWT RS256/ES256 permanecen vigentes; la
+autenticación local queda para otra tarea.
+
+### Configuración al arrancar
+
+No se copia ningún `.env` a la imagen. Solo se copian dependencias,
+`manage.py`, `config/` y `apps/`; `.dockerignore` excluye también secretos,
+entornos, cachés, logs y respaldos del contexto de construcción.
+Entrega las variables mediante `docker run --env-file <archivo-externo>` o
+el gestor de secretos del entorno, nunca mediante argumentos de build.
+El archivo externo debe ser privado y no versionarse.
+
+Variables leídas por `config/settings.py`:
+
+| Grupo | Variables |
+| --- | --- |
+| Django | `SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS` (separados por comas) |
+| PostgreSQL | `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_SSLMODE` |
+| Supabase | `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SUPABASE_JWT_ISSUER`, `SUPABASE_JWT_AUDIENCE` |
+| Frontend/CORS | `FRONTEND_URL` |
+| Operaciones | `TECHNICAL_BACKUP_DIR`, `TECHNICAL_ALLOW_RESTORE`, `TECHNICAL_COMMAND_TIMEOUT`, `TECHNICAL_SLOW_REQUEST_MS` |
+
+Para un entorno real define una `SECRET_KEY` aleatoria, `DEBUG=False`, hosts
+explícitos y credenciales de una base autorizada. `DB_SSLMODE` vale `require`
+por defecto. Dentro del contenedor, `localhost` se refiere al propio
+contenedor: para PostgreSQL en Windows usa `host.docker.internal`; para otro
+contenedor usa su nombre DNS en una red Docker compartida. No hace falta
+publicar el puerto de PostgreSQL para conectar contenedores en esa red.
+El issuer predeterminado es `<SUPABASE_URL>/auth/v1`, la audiencia es
+`authenticated` y `TECHNICAL_ALLOW_RESTORE` debe permanecer en `false`.
+
+### Repetir la prueba sin secretos ni base real (PowerShell)
+
+Ejecutar desde la raíz del backend. Docker elige un puerto libre y lo publica
+solo en loopback. Todos los valores siguientes son ficticios. La prueba
+espera un 401 con `WWW-Authenticate: Bearer` en una ruta protegida existente.
+Ese resultado comprueba Django/DRF y la protección sin consultar Supabase;
+no valida una lectura de negocio ni la conexión PostgreSQL. El middleware
+intenta registrar telemetría en la base y tolera que no esté disponible.
+
+```powershell
+docker build -t wms-backend:docker-test .
+if ($LASTEXITCODE -ne 0) { throw 'Falló la construcción' }
+$containerName = 'wms-backend-smoke-' + [guid]::NewGuid().ToString('N')
+try {
+    docker run -d --name $containerName -p 127.0.0.1::8000 `
+      -e SECRET_KEY=smoke-only-not-for-production -e DEBUG=False `
+      -e ALLOWED_HOSTS=localhost,127.0.0.1 `
+      -e DB_NAME=wms_smoke -e DB_USER=wms_smoke -e DB_PASSWORD=smoke-only `
+      -e DB_HOST=127.0.0.1 -e DB_PORT=1 -e DB_SSLMODE=disable `
+      -e SUPABASE_URL=https://smoke.invalid -e SUPABASE_SECRET_KEY=smoke-only `
+      -e TECHNICAL_ALLOW_RESTORE=False wms-backend:docker-test
+    if ($LASTEXITCODE -ne 0) { throw 'Falló el arranque' }
+    $binding = docker port $containerName 8000/tcp
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        $status = curl.exe -s --max-time 3 -o NUL -w '%{http_code}' "http://$binding/api/auth/me/"
+        if ($status -eq '401') { $ready = $true; break }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $ready) { throw "La API no respondió 401: $status" }
+    $response = curl.exe -s -i --max-time 5 "http://$binding/api/auth/me/"
+    if ($LASTEXITCODE -ne 0 -or ($response -join "`n") -notmatch '(?im)^WWW-Authenticate: Bearer\s*$') {
+        throw 'Falta WWW-Authenticate: Bearer'
+    }
+    $response
+    docker exec $containerName id
+    docker exec $containerName gunicorn --version
+    docker exec $containerName python manage.py check
+    docker logs $containerName
+} finally {
+    # Solo elimina el contenedor de esta prueba; conserva la imagen.
+    docker rm -f $containerName
+}
+```
+
+Con una base de pruebas y un usuario Supabase autorizado, arranca la misma
+imagen con `--env-file <archivo-externo-de-pruebas>` y las variables reales de
+ese entorno. Comprueba `GET /api/auth/me/` y una lectura permitida como
+`GET /api/clients/` usando el access token en `Authorization: Bearer ...`;
+espera 200 y verifica el contenido. No incluyas el token en archivos del repo
+ni en registros compartidos.
+
+### Migraciones, restauración y respaldos
+
+Ejecuta las migraciones como operación independiente, contra la base de
+pruebas elegida, antes de la prueba de lectura:
+
+```powershell
+docker run --rm --env-file <archivo-externo-de-pruebas> wms-backend:docker-test python manage.py migrate --plan
+docker run --rm --env-file <archivo-externo-de-pruebas> wms-backend:docker-test python manage.py migrate
+```
+
+Una restauración requiere otra operación explícita y una ventana de
+mantenimiento; nunca va en el Dockerfile ni en el comando de inicio.
+La imagen mínima no instala `pg_dump` ni `pg_restore`. EP-08 usa como
+alternativa `dumpdata` comprimido, que no equivale a un respaldo completo de
+PostgreSQL y no sirve para su restauración controlada de formato custom.
+Antes de habilitar esos flujos, identifica la versión del servidor destino
+con `SHOW server_version;` e incorpora un cliente PostgreSQL de la misma
+versión mayor (por ejemplo, servidor 17: cliente 17, con parche actualizado).
+Usa también ese cliente para generar y validar el dump; no asumas que el
+cliente predeterminado de Debian coincide con Supabase. Verifica
+`pg_dump --version` y `pg_restore --version`. La versión del destino no se
+ha comprobado en esta prueba. Para operaciones EP-08 persistentes, monta
+`/app/var/backups` con permisos de escritura para UID/GID 10001 y conserva
+`TECHNICAL_ALLOW_RESTORE=false` salvo la ventana explícita de restauración.
+
+### Archivos estáticos
+
+Actualmente solo existe `STATIC_URL=static/`: no hay `STATIC_ROOT`, WhiteNoise
+ni servidor de estáticos. Gunicorn no sirve los CSS/JS de `/admin/`.
+La prueba JSON no requiere estáticos. Antes de publicar el admin, configura
+un servidor externo (por ejemplo Nginx) para `/static/` y recoge los archivos
+en un volumen independiente. Sin modificar los settings actuales se puede
+generar la salida así, usando un volumen preparado para UID 10001:
+
+```powershell
+docker run --rm --env-file <archivo-externo-de-pruebas> --mount type=volume,source=wms-static,target=/app/staticfiles wms-backend:docker-test python -c "import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings'); import django; django.setup(); from django.conf import settings; settings.STATIC_ROOT='/app/staticfiles'; from django.core.management import call_command; call_command('collectstatic', interactive=False)"
+```
+
+El servidor de estáticos debe montar ese volumen de solo lectura. Este paso
+es independiente del arranque, de las migraciones y de la restauración.
+
+### Resultado de la prueba del 9 de noviembre de 2026
+
+- Construcción de `wms-backend:docker-test` completada con Python 3.12.16
+  y Gunicorn 26.0.0; versión verificada con `gunicorn --version` dentro del
+  contenedor y ambos workers cargaron Django.
+- Publicación temporal en `127.0.0.1:65018`; `GET /api/auth/me/` sin token
+  devolvió 401 JSON y `WWW-Authenticate: Bearer`, como corresponde.
+- `python manage.py check` sin incidencias; proceso con UID/GID 10001.
+- Imagen reconstruida con `--no-control-socket` en su `CMD`. Prueba repetida
+  sin `GUNICORN_CMD_ARGS` (ausencia verificada dentro del contenedor): los logs
+  no muestran errores del socket de control ni permisos denegados.
+- La prueba inicial de Docker comprobó la ausencia de `.env*` y `.git` en
+  `/app`. En esta actualización no se leyó el `.env` real y solo se
+  inyectaron valores ficticios al contenedor.
+- Contenedor temporal eliminado; imagen conservada para revisión.
+- Pendientes: lectura autenticada de la API contra PostgreSQL de pruebas y
+  validación real de Supabase (no se proporcionó una base/token de pruebas),
+  migraciones/restauración, versión del cliente PostgreSQL del destino y
+  publicación de estáticos. No se ejecutó commit, push ni despliegue.
