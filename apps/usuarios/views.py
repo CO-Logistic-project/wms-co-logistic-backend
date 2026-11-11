@@ -91,12 +91,21 @@ class LoginView(APIView):
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        result = local_auth.login(
-            serializer.validated_data["correo"],
-            serializer.validated_data["password"],
-            ip=_client_ip(request),
-            user_agent=_user_agent(request),
-        )
+        try:
+            result = local_auth.login(
+                serializer.validated_data["correo"],
+                serializer.validated_data["password"],
+                ip=_client_ip(request),
+                user_agent=_user_agent(request),
+            )
+        except local_auth.InvalidCredentials as exc:
+            # No authenticator => DRF would answer 403; a failed login is 401.
+            return _no_store(
+                Response(
+                    {"detail": str(exc.detail), "code": exc.default_code},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            )
         return _token_response(result)
 
 
