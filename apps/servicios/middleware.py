@@ -44,7 +44,7 @@ class TechnicalObservabilityMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        if not request.path.startswith("/api/"):
+        if not request.path.startswith("/api/") or request.path == "/api/health/":
             return self.get_response(request)
         started = time.perf_counter()
         initial_queries = len(connection.queries)

@@ -1,0 +1,212 @@
+name: CI/CD Backend WMS
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GCP_REGION: southamerica-west1
+  AR_REPO: wms-repo
+  IMAGE_NAME: wms-backend
+
+jobs:
+  ci:
+    name: Django Check & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Django check and unit tests
+        env:
+          SECRET_KEY: ci-ephemeral-secret-key-not-for-production
+          DEBUG: "False"
+          ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+          FRONTEND_URL: https://wms.cologistic.net
+        run: |
+          python manage.py check
+          python manage.py test -v 2
+
+  build-and-push:
+    name: Build & Push Docker Image (GCP Artifact Registry)
+    needs: ci
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_sha: ${{ steps.meta.outputs.image_sha }}
+      registry: ${{ steps.meta.outputs.registry }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Artifact Registry coordinates
+        id: meta
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT_ID || 'cologistic-cloud' }}
+          SHA: ${{ github.sha }}
+        run: |
+          REGISTRY="${GCP_REGION}-docker.pkg.dev"
+          IMAGE_BASE="${REGISTRY}/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "image_sha=${IMAGE_BASE}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_latest=${IMAGE_BASE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || 'projects/637731567164/locations/global/workloadIdentityPools/github-actions/providers/github' }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT || 'github-ci@cologistic-cloud.iam.gserviceaccount.com' }}
+
+      - name: Set up Cloud SDK & configure Docker auth
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ steps.meta.outputs.registry }}" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_sha }}
+            ${{ steps.meta.outputs.image_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-onpremise:
+    name: Deploy to WMS01 & WMS02 (Tailscale VPN)
+    needs: build-and-push
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: wms-deploy-onpremise
+      cancel-in-progress: false
+    steps:
+      - name: Authenticate to Google Cloud (Workload Identity Federation OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || 'projects/637731567164/locations/global/workloadIdentityPools/github-actions/providers/github' }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT || 'github-ci@cologistic-cloud.iam.gserviceaccount.com' }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Connect to CoLogistic Tailscale Network
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --accept-routes --hostname=gha-wms-backend-${{ github.run_id }}
+
+      - name: Deploy migrations & rolling restart (WMS01 -> WMS02)
+        env:
+          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          IMAGE_SHA: ${{ needs.build-and-push.outputs.image_sha }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ci-deploy' }}
+          WMS01_HOST: ${{ vars.WMS01_HOST || '10.10.31.11' }}
+          WMS02_HOST: ${{ vars.WMS02_HOST || '10.10.31.12' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          AR_TOKEN="$(gcloud auth print-access-token)"
+          echo "::add-mask::${AR_TOKEN}"
+
+          echo "[CI] Verificando alcance privado vía Tailscale hacia ${WMS01_HOST}:22..."
+          for attempt in $(seq 1 15); do
+            if nc -z -w 3 "${WMS01_HOST}" 22; then
+              break
+            fi
+            sleep 2
+          done
+
+          MIGRATED=0
+          for HOST in "${WMS01_HOST}" "${WMS02_HOST}"; do
+            echo "[CI] === Desplegando wms-backend en ${HOST} ==="
+            printf '%s\n' "${AR_TOKEN}" | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+              "${DEPLOY_USER}@${HOST}" "docker login -u oauth2accesstoken --password-stdin '${REGISTRY}'"
+
+            RUN_MIGRATE=0
+            if [ "${MIGRATED}" -eq 0 ]; then
+              RUN_MIGRATE=1
+              MIGRATED=1
+            fi
+
+            ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+              "${DEPLOY_USER}@${HOST}" \
+              "REGISTRY='${REGISTRY}' IMAGE_SHA='${IMAGE_SHA}' RUN_MIGRATE='${RUN_MIGRATE}' bash -s" <<'REMOTE_EOF'
+          set -euo pipefail
+          trap "docker logout '${REGISTRY}' >/dev/null 2>&1 || true" EXIT
+
+          docker pull "${IMAGE_SHA}"
+          docker tag "${IMAGE_SHA}" cologistic/wms-backend:latest
+
+          cd /opt/wms
+          if [ "${RUN_MIGRATE}" -eq 1 ]; then
+            echo "[CD] Verificando esquema base (maestros.ubicacion) en db.cologistic.net..."
+            if docker compose run --rm --no-deps wms-api python -c "import os, sys, django; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings'); django.setup(); from django.db import connection; c = connection.cursor(); c.execute(\"SELECT to_regclass('maestros.ubicacion')\"); sys.exit(0 if c.fetchone()[0] else 10)"; then
+              echo "[CD] Esquema base detectado; ejecutando migraciones Django (una sola vez)..."
+              docker compose run --rm --no-deps wms-api python manage.py migrate --noinput
+            else
+              rc=$?
+              if [ "$rc" -eq 10 ]; then
+                echo "[CD] Aviso: cologistic_wms aún no tiene el DDL base (maestros.ubicacion); omitiendo migrate hasta que el equipo cargue las tablas."
+              else
+                exit "$rc"
+              fi
+            fi
+          fi
+
+          docker compose up -d --no-deps --force-recreate wms-api
+          if docker image inspect cologistic/wms-frontend:latest >/dev/null 2>&1; then
+            docker compose up -d
+          fi
+
+          echo "[CD] Esperando /api/health/ en wms-api..."
+          for i in $(seq 1 20); do
+            if docker compose exec -T wms-api python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/')" >/dev/null 2>&1; then
+              if ! docker ps --filter "name=^wms-frontend$" --filter "status=running" -q | grep -q . || curl -ksf https://127.0.0.1/api/health/ >/dev/null; then
+                echo "[CD] Backend saludable en $(hostname)"
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          echo "[CD] ERROR: wms-api no respondió en /api/health/ tras esperar 40s" >&2
+          exit 1
+          REMOTE_EOF
+          done
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

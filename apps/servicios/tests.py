@@ -158,3 +158,10 @@ class ConditioningTests(SimpleTestCase):
         xlsx = _conditioning_file("Servicio REP-001", [], "xlsx")
         self.assertTrue(pdf.content.startswith(b"%PDF-1.4"))
         self.assertTrue(xlsx.content.startswith(b"PK"))
+
+
+class HealthEndpointTests(SimpleTestCase):
+    def test_health_endpoint_returns_ok_without_authentication(self):
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, 200)
+        self.assertJSONEqual(response.content, {"status": "ok", "service": "wms-api"})

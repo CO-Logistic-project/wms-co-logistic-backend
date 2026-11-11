@@ -48,6 +48,9 @@ ALLOWED_HOSTS = env.list(
     default=["localhost", "127.0.0.1"],
 )
 
+USE_X_FORWARDED_HOST = env.bool("USE_X_FORWARDED_HOST", default=True)
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 
 # =====================================================
 # APPLICATIONS
@@ -189,7 +192,7 @@ DATABASES = {
 
             "sslmode": env(
                 "DB_SSLMODE",
-                default="require"
+                default="prefer"
             ),
 
         },
@@ -251,6 +254,9 @@ USE_TZ = True
 # =====================================================
 
 STATIC_URL = "static/"
+STATIC_ROOT = Path(
+    env("STATIC_ROOT", default=str(BASE_DIR / "staticfiles"))
+)
 
 
 
@@ -320,12 +326,27 @@ SUPABASE_SECRET_KEY = env("SUPABASE_SECRET_KEY", default="")
 FRONTEND_URL = env(
     "FRONTEND_URL",
     default="http://localhost:5173",
-).rstrip("/")
+).strip()
 
-CORS_ALLOWED_ORIGINS = [FRONTEND_URL]
+_default_cors_origins = [
+    origin.strip().rstrip("/")
+    for origin in FRONTEND_URL.split(",")
+    if origin.strip()
+]
+if DEBUG and _default_cors_origins == ["http://localhost:5173"]:
+    _default_cors_origins.append("http://127.0.0.1:5173")
 
-if DEBUG and FRONTEND_URL == "http://localhost:5173":
-    CORS_ALLOWED_ORIGINS.append("http://127.0.0.1:5173")
+CORS_ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in env.list("CORS_ALLOWED_ORIGINS", default=_default_cors_origins)
+    if origin.strip()
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in env.list("CSRF_TRUSTED_ORIGINS", default=CORS_ALLOWED_ORIGINS)
+    if origin.strip()
+]
 
 
 # =====================================================

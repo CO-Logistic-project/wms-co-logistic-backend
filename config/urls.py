@@ -15,10 +15,30 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
+from django.db import connection
+from django.http import JsonResponse
 from django.urls import include, path
+
+
+def health_check(request):
+    """Lightweight liveness probe (passes ?deep=1 to also check DB connectivity)."""
+    payload = {"status": "ok", "service": "wms-api"}
+    if request.GET.get("deep") == "1":
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            payload["database"] = "ok"
+        except Exception as exc:
+            return JsonResponse(
+                {"status": "error", "service": "wms-api", "database": str(exc)},
+                status=503,
+            )
+    return JsonResponse(payload)
+
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/health/', health_check, name='api-health'),
     path('api/', include('apps.usuarios.urls')),
     path('api/', include('apps.maestros.urls')),
     path('api/', include('apps.recepciones.urls')),
