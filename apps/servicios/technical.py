@@ -315,11 +315,12 @@ def system_health(record_incidents=True):
     except Exception as exc:
         checks.append({"componente": "Base de datos", "estado": "FALLA", "detalle": str(exc)[:500]})
 
-    auth_ok = bool(settings.SUPABASE_URL and settings.SUPABASE_JWT_ISSUER)
+    signing_key = getattr(settings, "JWT_SIGNING_KEY", "")
+    auth_ok = bool(signing_key) and not signing_key.startswith("dev-only-")
     checks.append({
-        "componente": "Autenticación Supabase",
+        "componente": "Autenticación local",
         "estado": "OPERATIVO" if auth_ok else "DEGRADADO",
-        "detalle": "Configuración de autenticación disponible." if auth_ok else "Falta configuración de Supabase.",
+        "detalle": "Llave de firma JWT configurada." if auth_ok else "Falta JWT_SIGNING_KEY o se usa la llave de desarrollo.",
     })
     try:
         directory = _backup_directory()
