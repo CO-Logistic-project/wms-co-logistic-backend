@@ -153,8 +153,10 @@ jobs:
           MIGRATED=0
           for HOST in "${WMS01_HOST}" "${WMS02_HOST}"; do
             echo "[CI] === Desplegando wms-backend en ${HOST} ==="
+            REMOTE_DC="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+              "${DEPLOY_USER}@${HOST}" "mktemp -d")"
             printf '%s\n' "${AR_TOKEN}" | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
-              "${DEPLOY_USER}@${HOST}" "docker login -u oauth2accesstoken --password-stdin '${REGISTRY}'"
+              "${DEPLOY_USER}@${HOST}" "DOCKER_CONFIG='${REMOTE_DC}' docker login -u oauth2accesstoken --password-stdin '${REGISTRY}'"
 
             RUN_MIGRATE=0
             if [ "${MIGRATED}" -eq 0 ]; then
@@ -164,11 +166,11 @@ jobs:
 
             ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
               "${DEPLOY_USER}@${HOST}" \
-              "REGISTRY='${REGISTRY}' IMAGE_SHA='${IMAGE_SHA}' RUN_MIGRATE='${RUN_MIGRATE}' bash -s" <<'REMOTE_EOF'
+              "REGISTRY='${REGISTRY}' IMAGE_SHA='${IMAGE_SHA}' RUN_MIGRATE='${RUN_MIGRATE}' REMOTE_DC='${REMOTE_DC}' bash -s" <<'REMOTE_EOF'
           set -euo pipefail
-          trap "docker logout '${REGISTRY}' >/dev/null 2>&1 || true" EXIT
+          trap 'rm -rf "${REMOTE_DC}"' EXIT
 
-          docker pull "${IMAGE_SHA}"
+          DOCKER_CONFIG="${REMOTE_DC}" docker pull "${IMAGE_SHA}"
           docker tag "${IMAGE_SHA}" cologistic/wms-backend:latest
 
           cd /opt/wms
