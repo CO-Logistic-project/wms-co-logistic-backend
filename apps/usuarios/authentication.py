@@ -1,15 +1,12 @@
 import logging
-import ssl
 from dataclasses import dataclass
-from functools import lru_cache
 
-import certifi
-import jwt
-from django.conf import settings
 from django.db import DatabaseError
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
-from rest_framework.exceptions import APIException, AuthenticationFailed
+from rest_framework.exceptions import APIException, AuthenticationFailed, PermissionDenied
+from rest_framework.permissions import BasePermission
 
+from .local_auth import decode_access_token
 from .models import Usuario
 
 
@@ -23,7 +20,7 @@ class AuthenticationServiceUnavailable(APIException):
 
 
 @dataclass(frozen=True)
-class SupabasePrincipal:
+class AuthenticatedPrincipal:
     id: str
     email: str
     claims: dict
@@ -37,57 +34,14 @@ class SupabasePrincipal:
     def is_anonymous(self):
         return False
 
-
-@lru_cache(maxsize=4)
-def _get_jwks_client(jwks_url):
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
-    return jwt.PyJWKClient(
-        jwks_url,
-        cache_jwk_set=True,
-        lifespan=600,
-        ssl_context=ssl_context,
-    )
+    @property
+    def must_change_password(self):
+        return bool(self.claims.get("pwd_change"))
 
 
-def verify_supabase_token(token):
-    """Verify signature and mandatory claims of a Supabase access token."""
-    if not settings.SUPABASE_URL or not settings.SUPABASE_JWT_ISSUER:
-        logger.error("Supabase Auth is not configured")
-        raise AuthenticationServiceUnavailable()
+class LocalJWTAuthentication(BaseAuthentication):
+    """Validate the HS256 access token locally (no network access)."""
 
-    try:
-        header = jwt.get_unverified_header(token)
-        algorithm = header.get("alg")
-
-        if algorithm not in settings.SUPABASE_JWT_ALGORITHMS:
-            raise AuthenticationFailed("La sesión no es válida o ha expirado.")
-
-        jwks_url = (
-            f"{settings.SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-        )
-        signing_key = _get_jwks_client(jwks_url).get_signing_key_from_jwt(token)
-
-        return jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=[algorithm],
-            audience=settings.SUPABASE_JWT_AUDIENCE,
-            issuer=settings.SUPABASE_JWT_ISSUER,
-            options={"require": ["exp", "iss", "aud", "sub"]},
-        )
-    except AuthenticationFailed:
-        raise
-    except (jwt.PyJWTError, ValueError) as exc:
-        logger.info("Supabase JWT rejected: %s", exc.__class__.__name__)
-        raise AuthenticationFailed(
-            "La sesión no es válida o ha expirado."
-        ) from exc
-    except Exception as exc:
-        logger.exception("Supabase JWKS validation failed")
-        raise AuthenticationServiceUnavailable() from exc
-
-
-class SupabaseJWTAuthentication(BaseAuthentication):
     keyword = "Bearer"
 
     def authenticate(self, request):
@@ -109,11 +63,8 @@ class SupabaseJWTAuthentication(BaseAuthentication):
                 "Encabezado de autorización inválido."
             ) from exc
 
-        claims = verify_supabase_token(token)
+        claims = decode_access_token(token)
         user_id = claims.get("sub")
-
-        if not user_id:
-            raise AuthenticationFailed("La sesión no es válida o ha expirado.")
 
         try:
             profile = Usuario.objects.filter(id_usuario=user_id).first()
@@ -126,7 +77,7 @@ class SupabaseJWTAuthentication(BaseAuthentication):
                 "La cuenta no está habilitada para acceder al sistema."
             )
 
-        principal = SupabasePrincipal(
+        principal = AuthenticatedPrincipal(
             id=str(profile.id_usuario),
             email=claims.get("email") or profile.correo,
             claims=claims,
@@ -136,3 +87,23 @@ class SupabaseJWTAuthentication(BaseAuthentication):
 
     def authenticate_header(self, request):
         return self.keyword
+
+
+class PasswordChangeNotPending(BasePermission):
+    """Block every endpoint while the user must change a temporary password.
+
+    Views that must stay reachable set ``allow_pending_password_change = True``.
+    """
+
+    def has_permission(self, request, view):
+        if getattr(view, "allow_pending_password_change", False):
+            return True
+        if getattr(request.user, "must_change_password", False):
+            raise PermissionDenied(
+                detail={
+                    "detail": "Debes cambiar tu contraseña antes de continuar.",
+                    "code": "password_change_required",
+                },
+                code="password_change_required",
+            )
+        return True

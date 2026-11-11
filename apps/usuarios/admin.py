@@ -19,7 +19,7 @@ class UsuarioAdmin(admin.ModelAdmin):
     )
 
     def has_add_permission(self, request):
-        # Users must be created through the WMS so Supabase Auth stays in sync.
+        # Users must be created through the WMS so their credential is created too.
         return False
 
     def has_delete_permission(self, request, obj=None):

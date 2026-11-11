@@ -1,10 +1,29 @@
+from types import SimpleNamespace
+
 from rest_framework import serializers
 
+from .local_auth import check_password_policy
 from .models import Permiso, Rol, Usuario
 
 
 def _strip(value):
     return value.strip()
+
+
+class LoginSerializer(serializers.Serializer):
+    correo = serializers.CharField(max_length=255, trim_whitespace=True)
+    password = serializers.CharField(
+        max_length=128, write_only=True, trim_whitespace=False
+    )
+
+
+class PasswordChangeSerializer(serializers.Serializer):
+    password_actual = serializers.CharField(
+        max_length=128, write_only=True, trim_whitespace=False
+    )
+    password_nueva = serializers.CharField(
+        max_length=128, write_only=True, trim_whitespace=False
+    )
 
 
 class UserCreateSerializer(serializers.Serializer):
@@ -43,6 +62,15 @@ class UserCreateSerializer(serializers.Serializer):
                 "Uno o más roles no existen o están inactivos."
             )
         return role_ids
+
+    def validate(self, attrs):
+        profile = SimpleNamespace(
+            correo=attrs["correo"],
+            nombre=attrs["nombre"],
+            apellido=attrs["apellido"],
+        )
+        check_password_policy(attrs["password"], profile)
+        return attrs
 
 
 class UserUpdateSerializer(serializers.Serializer):

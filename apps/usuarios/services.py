@@ -1,25 +1,15 @@
-import logging
+import uuid
 
-from django.db import DatabaseError, IntegrityError, transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.exceptions import ValidationError
 
-from .models import Permiso, Rol, RolPermiso, Usuario, UsuarioRol
-from .supabase_admin import (
-    SupabaseAdminClient,
-    SupabaseAdminError,
-    SupabaseAdminNotConfigured,
-    SupabaseUserAlreadyExists,
+from .local_auth import (
+    generate_temporary_password,
+    revoke_all_sessions,
+    set_password,
 )
-
-
-logger = logging.getLogger(__name__)
-
-
-class IdentityServiceUnavailable(APIException):
-    status_code = 503
-    default_detail = "El servicio de identidad no está disponible temporalmente."
-    default_code = "identity_service_unavailable"
+from .models import Permiso, Rol, RolPermiso, Usuario, UsuarioRol
 
 
 def get_user_roles(user_id):
@@ -81,6 +71,7 @@ def build_user_access(principal):
     profile = principal.profile
     return {
         "id": principal.id,
+        "debe_cambiar_password": principal.must_change_password,
         "correo": profile.correo,
         "nombre": profile.nombre,
         "apellido": profile.apellido,
@@ -93,31 +84,12 @@ def build_user_access(principal):
 
 
 def create_application_user(validated_data):
-    client = SupabaseAdminClient()
-    try:
-        auth_user = client.create_user(
-            email=validated_data["correo"],
-            password=validated_data["password"],
-            first_name=validated_data["nombre"],
-            last_name=validated_data["apellido"],
-        )
-    except SupabaseUserAlreadyExists as exc:
-        raise ValidationError(
-            {"correo": ["Ya existe un usuario con este correo."]}
-        ) from exc
-    except (SupabaseAdminNotConfigured, SupabaseAdminError) as exc:
-        raise IdentityServiceUnavailable() from exc
-
-    auth_user_id = auth_user.get("id")
-    if not auth_user_id:
-        logger.error("Supabase Auth create user response did not include an id")
-        raise IdentityServiceUnavailable()
-
+    """Create profile, roles and the initial (must-change) credential."""
     now = timezone.now()
     try:
         with transaction.atomic():
             user = Usuario.objects.create(
-                id_usuario=auth_user_id,
+                id_usuario=uuid.uuid4(),
                 nombre=validated_data["nombre"],
                 apellido=validated_data["apellido"],
                 correo=validated_data["correo"],
@@ -131,13 +103,13 @@ def create_application_user(validated_data):
                     for role_id in validated_data["role_ids"]
                 ]
             )
-    except IntegrityError as exc:
-        try:
-            client.delete_user(auth_user_id)
-        except SupabaseAdminError:
-            logger.exception(
-                "Could not compensate Supabase user after database failure"
+            set_password(
+                user.id_usuario,
+                validated_data["password"],
+                must_change=True,
+                user=user,
             )
+    except IntegrityError as exc:
         raise ValidationError(
             {"correo": ["No fue posible registrar el usuario sin duplicarlo."]}
         ) from exc
@@ -146,27 +118,6 @@ def create_application_user(validated_data):
 
 
 def update_application_user(user, validated_data):
-    client = SupabaseAdminClient()
-    old_values = {
-        "email": user.correo,
-        "first_name": user.nombre,
-        "last_name": user.apellido,
-    }
-
-    try:
-        client.update_user(
-            str(user.id_usuario),
-            email=validated_data["correo"],
-            first_name=validated_data["nombre"],
-            last_name=validated_data["apellido"],
-        )
-    except SupabaseUserAlreadyExists as exc:
-        raise ValidationError(
-            {"correo": ["Ya existe un usuario con este correo."]}
-        ) from exc
-    except (SupabaseAdminNotConfigured, SupabaseAdminError) as exc:
-        raise IdentityServiceUnavailable() from exc
-
     try:
         with transaction.atomic():
             user.nombre = validated_data["nombre"]
@@ -182,12 +133,6 @@ def update_application_user(user, validated_data):
                 ]
             )
     except IntegrityError as exc:
-        try:
-            client.update_user(str(user.id_usuario), **old_values)
-        except SupabaseAdminError:
-            logger.exception(
-                "Could not compensate Supabase user after database update failure"
-            )
         raise ValidationError(
             {"correo": ["No fue posible actualizar el usuario sin duplicarlo."]}
         ) from exc
@@ -211,33 +156,21 @@ def set_application_user_status(user, active):
     if user.estado == active:
         return user
 
-    client = SupabaseAdminClient()
-    try:
-        client.set_user_active(str(user.id_usuario), active=active)
-    except (SupabaseAdminNotConfigured, SupabaseAdminError) as exc:
-        raise IdentityServiceUnavailable() from exc
-
-    previous_status = user.estado
-    try:
-        with transaction.atomic():
-            user.estado = active
-            user.fecha_actualizacion = timezone.now()
-            user.save(update_fields=["estado", "fecha_actualizacion"])
-    except DatabaseError as exc:
-        user.estado = previous_status
-        try:
-            client.set_user_active(
-                str(user.id_usuario), active=previous_status
-            )
-        except SupabaseAdminError:
-            logger.exception(
-                "Could not compensate Supabase user after status update failure"
-            )
-        raise IdentityServiceUnavailable(
-            "No fue posible actualizar el estado del usuario."
-        ) from exc
+    with transaction.atomic():
+        user.estado = active
+        user.fecha_actualizacion = timezone.now()
+        user.save(update_fields=["estado", "fecha_actualizacion"])
+        if not active:
+            revoke_all_sessions(user.id_usuario)
 
     return user
+
+
+def reset_user_password(user):
+    """Set a one-time temporary password and return it (shown only once)."""
+    temporary = generate_temporary_password(user)
+    set_password(user.id_usuario, temporary, must_change=True, user=user)
+    return temporary
 
 
 def save_role(validated_data, role=None):
