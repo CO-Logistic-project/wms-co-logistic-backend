@@ -1,44 +1,69 @@
 # WMS Co-Logistic Backend
 
-API empresarial del WMS construida con Django REST Framework. Supabase Auth
-autentica a los usuarios y esta API valida sus JWT antes de aplicar el estado,
-los roles y los permisos almacenados en PostgreSQL.
+API empresarial del WMS construida con Django REST Framework. La
+autenticación es local (Django + PostgreSQL): esta API emite y valida sus
+propios JWT y aplica el estado, los roles y los permisos almacenados en
+PostgreSQL.
 
 ## Configuración local
 
 1. Crea y activa un entorno virtual.
 2. Instala las dependencias con `pip install -r requirements.txt`.
-3. Crea `.env` y completa PostgreSQL, `SUPABASE_URL` y
-   `SUPABASE_SECRET_KEY`.
-4. En Supabase Auth configura una llave asimétrica RS256 o ES256.
-5. Inicia el servidor con `python manage.py runserver`.
-
-El backend obtiene las llaves públicas desde el endpoint JWKS de Supabase. La
-llave `SUPABASE_SECRET_KEY=sb_secret_...` se usa solo en el servidor para las
-altas y actualizaciones de Supabase Auth. Nunca debe incluirse en React, Git,
-capturas ni mensajes.
+3. Copia `.env.example` a `.env` y completa PostgreSQL. Con `DEBUG=False`
+   `JWT_SIGNING_KEY` es obligatoria (sin ella el arranque falla con
+   `ImproperlyConfigured`); con `DEBUG=True` se deriva de `SECRET_KEY` con el
+   prefijo `dev-only-`.
+4. Aplica las migraciones (`python manage.py migrate`): crean
+   `usuarios.credencial` y `usuarios.sesion` y, si existe
+   `usuarios.supabase_auth_export`, importan los hashes bcrypt de Supabase.
+5. Define la clave del primer administrador:
+   `python manage.py set_user_password --email admin@cologistic.com`
+   (pide la clave con `getpass`; `--temporal` obliga a cambiarla al ingresar).
+6. Inicia el servidor con `python manage.py runserver`.
 
 ## Autenticación
 
-Las solicitudes protegidas deben enviar:
+- Access token: JWT HS256 firmado con `JWT_SIGNING_KEY`, 15 minutos. Claims:
+  `sub`, `email`, `iss`, `aud`, `iat`, `exp`, `typ="access"`, `pwd_change`.
+  Se envía como `Authorization: Bearer <access>`.
+- Refresh token: valor aleatorio opaco de 8 horas; en la base solo se guarda su
+  SHA-256. Viaja únicamente en la cookie `wms_refresh` (`HttpOnly`,
+  `SameSite=Strict`, `Path=/api/auth/`, `Secure` configurable con
+  `AUTH_COOKIE_SECURE`). Rota en cada uso; si se reutiliza uno ya rotado se
+  revocan todas las sesiones del usuario.
+- Bloqueo: 5 intentos fallidos bloquean la cuenta 15 minutos. Correo inexistente,
+  contraseña errónea, cuenta bloqueada o inactiva devuelven el mismo mensaje.
+- Contraseñas: PBKDF2 (hashers de Django); los hashes `bcrypt$…` importados de
+  Supabase se re-hashean a PBKDF2 en el primer login. Política: validadores de
+  Django, letras y números, y sin la parte local del correo.
+- No hay recuperación por correo: un usuario con `usuarios.editar` resetea la
+  clave de otro; el sistema genera una temporal que se muestra una sola vez y
+  el usuario debe cambiarla. Igual para la clave inicial de un usuario nuevo.
+  Mientras el cambio esté pendiente (`pwd_change=true`) todo endpoint responde
+  `403` con `code: password_change_required`, salvo `auth/me/` y
+  `auth/password/change/`.
 
-```http
-Authorization: Bearer <supabase_access_token>
-```
+| Endpoint | Descripción |
+| --- | --- |
+| `POST /api/auth/login/` `{correo, password}` | `{access, expires_in, debe_cambiar_password}` + cookie. Throttle 10/min |
+| `POST /api/auth/refresh/` | Rota la cookie; `401` y la borra si es inválida. Throttle 30/min |
+| `POST /api/auth/logout/` | Revoca la sesión, borra la cookie, `204` |
+| `POST /api/auth/password/change/` `{password_actual, password_nueva}` | Cambia la clave y abre una sesión nueva |
+| `GET /api/auth/me/` | Perfil, roles y permisos efectivos |
+| `POST /api/users/<uuid>/password/reset/` | `{id_usuario, password_temporal}` (permiso `usuarios.editar`, no sobre la propia cuenta) |
 
-`GET /api/auth/me/` valida el token, verifica que exista un perfil activo en
-`usuarios.usuario` y devuelve sus roles y permisos efectivos.
-
-El UUID de `usuarios.usuario.id_usuario` debe ser igual al UUID del usuario en
-`auth.users.id` de Supabase.
+Las respuestas con tokens llevan `Cache-Control: no-store`. Como el refresh usa
+cookies, `CORS_ALLOW_CREDENTIALS=True`: `FRONTEND_URL`/`CORS_ALLOWED_ORIGINS`
+deben ser orígenes explícitos y el frontend debe llamar con
+`credentials: "include"`.
 
 ## HU-002, HU-003 y HU-004
 
-- `GET/POST /api/users/`: consulta y registro sincronizado de usuarios.
-- `PATCH /api/users/<uuid>/`: actualización sincronizada del perfil y Auth.
+- `GET/POST /api/users/`: consulta y registro de usuarios (con contraseña inicial temporal).
+- `PATCH /api/users/<uuid>/`: actualización del perfil.
 - `PUT /api/users/<uuid>/roles/`: reemplazo controlado de roles.
-- `PATCH /api/users/<uuid>/status/`: desactivación o reactivación sincronizada
-  con Supabase Auth.
+- `PATCH /api/users/<uuid>/status/`: desactivación o reactivación (al desactivar se
+  revocan sus sesiones).
 - `GET/POST/PATCH /api/roles/`: administración de roles y permisos.
 - `GET /api/permissions/`: catálogo de permisos activos.
 
@@ -49,9 +74,9 @@ administrador de forma idempotente:
 python manage.py bootstrap_access --admin-email admin@cologistic.com
 ```
 
-Una cuenta inactiva queda bloqueada en Supabase Auth y Django continúa
-rechazando cualquier access token previamente emitido al comprobar
-`usuarios.usuario.estado` en cada solicitud.
+Una cuenta inactiva pierde sus sesiones de refresh y Django rechaza cualquier
+access token previamente emitido al comprobar `usuarios.usuario.estado` en
+cada solicitud.
 
 ## EP-02: catálogos maestros
 
@@ -181,8 +206,7 @@ El `CMD` de la imagen ya incluye `--no-control-socket`: desactiva la interfaz
 de control opcional y evita que intente crear su socket bajo `/home/wms`,
 ya que el usuario no tiene directorio home. No requiere variables adicionales.
 Véase la [configuración oficial del socket de control](https://gunicorn.org/reference/settings/#control-socket-disable).
-Supabase Auth y la validación JWT RS256/ES256 permanecen vigentes; la
-autenticación local queda para otra tarea.
+La autenticación es local (véase «Autenticación»).
 
 ### Configuración al arrancar
 
@@ -199,25 +223,25 @@ Variables leídas por `config/settings.py`:
 | --- | --- |
 | Django | `SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS` (separados por comas) |
 | PostgreSQL | `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_SSLMODE` |
-| Supabase | `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SUPABASE_JWT_ISSUER`, `SUPABASE_JWT_AUDIENCE` |
+| Autenticación | `JWT_SIGNING_KEY` (obligatoria con `DEBUG=False`), `AUTH_COOKIE_SECURE` (por defecto `not DEBUG`) |
 | Frontend/CORS | `FRONTEND_URL` |
 | Operaciones | `TECHNICAL_BACKUP_DIR`, `TECHNICAL_ALLOW_RESTORE`, `TECHNICAL_COMMAND_TIMEOUT`, `TECHNICAL_SLOW_REQUEST_MS` |
 
 Para un entorno real define una `SECRET_KEY` aleatoria, `DEBUG=False`, hosts
-explícitos y credenciales de una base autorizada. `DB_SSLMODE` vale `require`
+explícitos y credenciales de una base autorizada. `DB_SSLMODE` vale `prefer`
 por defecto. Dentro del contenedor, `localhost` se refiere al propio
 contenedor: para PostgreSQL en Windows usa `host.docker.internal`; para otro
 contenedor usa su nombre DNS en una red Docker compartida. No hace falta
 publicar el puerto de PostgreSQL para conectar contenedores en esa red.
-El issuer predeterminado es `<SUPABASE_URL>/auth/v1`, la audiencia es
-`authenticated` y `TECHNICAL_ALLOW_RESTORE` debe permanecer en `false`.
+El issuer JWT es `wms-cologistic`, la audiencia `wms` y
+`TECHNICAL_ALLOW_RESTORE` debe permanecer en `false`.
 
 ### Repetir la prueba sin secretos ni base real (PowerShell)
 
 Ejecutar desde la raíz del backend. Docker elige un puerto libre y lo publica
 solo en loopback. Todos los valores siguientes son ficticios. La prueba
 espera un 401 con `WWW-Authenticate: Bearer` en una ruta protegida existente.
-Ese resultado comprueba Django/DRF y la protección sin consultar Supabase;
+Ese resultado comprueba Django/DRF y la protección sin autenticar a ningún usuario;
 no valida una lectura de negocio ni la conexión PostgreSQL. El middleware
 intenta registrar telemetría en la base y tolera que no esté disponible.
 
@@ -231,7 +255,7 @@ try {
       -e ALLOWED_HOSTS=localhost,127.0.0.1 `
       -e DB_NAME=wms_smoke -e DB_USER=wms_smoke -e DB_PASSWORD=smoke-only `
       -e DB_HOST=127.0.0.1 -e DB_PORT=1 -e DB_SSLMODE=disable `
-      -e SUPABASE_URL=https://smoke.invalid -e SUPABASE_SECRET_KEY=smoke-only `
+      -e JWT_SIGNING_KEY=smoke-only-not-for-production-0123456789 `
       -e TECHNICAL_ALLOW_RESTORE=False wms-backend:docker-test
     if ($LASTEXITCODE -ne 0) { throw 'Falló el arranque' }
     $binding = docker port $containerName 8000/tcp
@@ -257,7 +281,7 @@ try {
 }
 ```
 
-Con una base de pruebas y un usuario Supabase autorizado, arranca la misma
+Con una base de pruebas y un usuario autorizado, arranca la misma
 imagen con `--env-file <archivo-externo-de-pruebas>` y las variables reales de
 ese entorno. Comprueba `GET /api/auth/me/` y una lectura permitida como
 `GET /api/clients/` usando el access token en `Authorization: Bearer ...`;
@@ -321,6 +345,6 @@ es independiente del arranque, de las migraciones y de la restauración.
   inyectaron valores ficticios al contenedor.
 - Contenedor temporal eliminado; imagen conservada para revisión.
 - Pendientes: lectura autenticada de la API contra PostgreSQL de pruebas y
-  validación real de Supabase (no se proporcionó una base/token de pruebas),
+  validación real del login (no se proporcionó una base/token de pruebas),
   migraciones/restauración, versión del cliente PostgreSQL del destino y
   publicación de estáticos. No se ejecutó commit, push ni despliegue.
