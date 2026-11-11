@@ -4,9 +4,9 @@ import hashlib
 import io
 import json
 import os
-import resource
 import shutil
 import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -16,6 +16,11 @@ from django.db import connection
 from django.db.models import Avg, Count, Max, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+
+try:  # not available on Windows
+    import resource
+except ImportError:
+    resource = None
 
 from .models import (
     Despliegue,
@@ -431,7 +436,9 @@ def audit_csv(queryset):
 
 
 def memory_usage_mb():
+    if resource is None:
+        return None
     value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if os.uname().sysname == "Darwin":
+    if sys.platform == "darwin":
         return value / 1024 / 1024
     return value / 1024
