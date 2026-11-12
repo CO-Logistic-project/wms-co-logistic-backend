@@ -1,13 +1,19 @@
+from django.conf import settings
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
+from . import local_auth
 from .models import Permiso, Rol, Usuario
 from .permissions import require_application_permission
 from .serializers import (
+    LoginSerializer,
+    PasswordChangeSerializer,
     RoleAssignmentSerializer,
     RoleWriteSerializer,
     UserCreateSerializer,
@@ -18,6 +24,7 @@ from .services import (
     build_user_access,
     create_application_user,
     replace_user_roles,
+    reset_user_password,
     save_role,
     serialize_role,
     serialize_user,
@@ -26,8 +33,135 @@ from .services import (
 )
 
 
+def _no_store(response):
+    response["Cache-Control"] = "no-store"
+    response["Pragma"] = "no-cache"
+    return response
+
+
+def _client_ip(request):
+    # Informational only (session list); not used for any security decision.
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    first = forwarded.split(",")[0].strip()
+    return (first or request.META.get("REMOTE_ADDR") or "")[:45]
+
+
+def _user_agent(request):
+    return request.META.get("HTTP_USER_AGENT", "")[:255]
+
+
+def _set_refresh_cookie(response, result):
+    response.set_cookie(
+        settings.AUTH_REFRESH_COOKIE_NAME,
+        result.refresh_token,
+        max_age=result.refresh_max_age,
+        path=settings.AUTH_REFRESH_COOKIE_PATH,
+        secure=settings.AUTH_COOKIE_SECURE,
+        httponly=True,
+        samesite="Strict",
+    )
+
+
+def _delete_refresh_cookie(response):
+    response.delete_cookie(
+        settings.AUTH_REFRESH_COOKIE_NAME,
+        path=settings.AUTH_REFRESH_COOKIE_PATH,
+        samesite="Strict",
+    )
+
+
+def _token_response(result):
+    response = Response(
+        {
+            "access": result.access,
+            "expires_in": result.expires_in,
+            "debe_cambiar_password": result.must_change_password,
+        }
+    )
+    _set_refresh_cookie(response, result)
+    return _no_store(response)
+
+
+class LoginView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_login"
+
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = local_auth.login(
+                serializer.validated_data["correo"],
+                serializer.validated_data["password"],
+                ip=_client_ip(request),
+                user_agent=_user_agent(request),
+            )
+        except local_auth.InvalidCredentials as exc:
+            # No authenticator => DRF would answer 403; a failed login is 401.
+            return _no_store(
+                Response(
+                    {"detail": str(exc.detail), "code": exc.default_code},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            )
+        return _token_response(result)
+
+
+class RefreshView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_refresh"
+
+    def post(self, request):
+        raw = request.COOKIES.get(settings.AUTH_REFRESH_COOKIE_NAME)
+        try:
+            result = local_auth.refresh(
+                raw, ip=_client_ip(request), user_agent=_user_agent(request)
+            )
+        except local_auth.InvalidSession as exc:
+            response = Response(
+                {"detail": str(exc.detail), "code": exc.default_code},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+            _delete_refresh_cookie(response)
+            return _no_store(response)
+        return _token_response(result)
+
+
+class LogoutView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        local_auth.logout(request.COOKIES.get(settings.AUTH_REFRESH_COOKIE_NAME))
+        response = Response(status=status.HTTP_204_NO_CONTENT)
+        _delete_refresh_cookie(response)
+        return _no_store(response)
+
+
+class PasswordChangeView(APIView):
+    allow_pending_password_change = True
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = local_auth.change_own_password(
+            request.user.profile,
+            serializer.validated_data["password_actual"],
+            serializer.validated_data["password_nueva"],
+            ip=_client_ip(request),
+            user_agent=_user_agent(request),
+        )
+        return _token_response(result)
+
+
 class CurrentUserView(APIView):
     """Return the application profile and effective access for the session."""
+
+    allow_pending_password_change = True
 
     def get(self, request):
         return Response(build_user_access(request.user))
@@ -94,6 +228,25 @@ class UserStatusView(APIView):
             )
         user = set_application_user_status(user, active)
         return Response(serialize_user(user))
+
+
+class UserPasswordResetView(APIView):
+    def post(self, request, user_id):
+        require_application_permission(request.user, "usuarios.editar")
+        user = get_object_or_404(Usuario, id_usuario=user_id)
+        if str(user.id_usuario) == str(request.user.id):
+            raise ValidationError(
+                {"detail": ["No puedes restablecer tu propia contraseña."]}
+            )
+        temporary = reset_user_password(user)
+        return _no_store(
+            Response(
+                {
+                    "id_usuario": str(user.id_usuario),
+                    "password_temporal": temporary,
+                }
+            )
+        )
 
 
 class RoleListCreateView(APIView):

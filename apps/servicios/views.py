@@ -371,9 +371,6 @@ class IntegrationRetryView(APIView):
                 with connection.cursor() as cursor:
                     cursor.execute("SELECT 1")
                     cursor.fetchone()
-            elif "supabase" in original.integracion.lower():
-                if not settings.SUPABASE_URL:
-                    raise RuntimeError("Supabase no está configurado.")
             else:
                 raise RuntimeError("Esta integración no tiene un reintento automático autorizado.")
             state, detail = "COMPLETADO", "Reintento técnico completado."

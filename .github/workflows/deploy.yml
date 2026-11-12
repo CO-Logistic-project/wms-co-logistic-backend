@@ -38,6 +38,7 @@ jobs:
       - name: Run Django check and unit tests
         env:
           SECRET_KEY: ci-ephemeral-secret-key-not-for-production
+          JWT_SIGNING_KEY: ci-ephemeral-jwt-signing-key-not-for-production
           DEBUG: "False"
           ALLOWED_HOSTS: localhost,127.0.0.1,testserver
           FRONTEND_URL: https://wms.cologistic.net

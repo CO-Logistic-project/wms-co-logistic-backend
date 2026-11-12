@@ -7,7 +7,7 @@ from apps.usuarios.models import Permiso, Rol, RolPermiso, Usuario, UsuarioRol
 PERMISSIONS = {
     "dashboard.ver": "Acceder al panel principal del WMS.",
     "usuarios.ver": "Consultar el módulo y listado de usuarios.",
-    "usuarios.crear": "Registrar usuarios en Supabase Auth y el WMS.",
+    "usuarios.crear": "Registrar usuarios en el WMS con una contraseña inicial temporal.",
     "usuarios.editar": "Actualizar la información de los usuarios.",
     "usuarios.desactivar": "Desactivar y reactivar cuentas de usuario.",
     "usuarios.asignar_roles": "Asignar roles de acceso a los usuarios.",

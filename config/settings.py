@@ -9,6 +9,8 @@ from pathlib import Path
 import environ
 import os
 
+from django.core.exceptions import ImproperlyConfigured
+
 
 # =====================================================
 # BASE CONFIGURATION
@@ -154,7 +156,7 @@ ASGI_APPLICATION = "config.asgi.application"
 
 # =====================================================
 # DATABASE
-# PostgreSQL - Supabase Ready
+# PostgreSQL
 # =====================================================
 
 DATABASES = {
@@ -276,7 +278,7 @@ REST_FRAMEWORK = {
 
     "DEFAULT_AUTHENTICATION_CLASSES": [
 
-        "apps.usuarios.authentication.SupabaseJWTAuthentication",
+        "apps.usuarios.authentication.LocalJWTAuthentication",
 
     ],
 
@@ -284,7 +286,17 @@ REST_FRAMEWORK = {
 
         "rest_framework.permissions.IsAuthenticated",
 
+        "apps.usuarios.authentication.PasswordChangeNotPending",
+
     ],
+
+    "DEFAULT_THROTTLE_RATES": {
+
+        "auth_login": "10/min",
+
+        "auth_refresh": "30/min",
+
+    },
 
     "DEFAULT_RENDERER_CLASSES": [
 
@@ -296,26 +308,36 @@ REST_FRAMEWORK = {
 
 
 # =====================================================
-# SUPABASE AUTH
+# LOCAL AUTHENTICATION
 # =====================================================
 
-SUPABASE_URL = env("SUPABASE_URL", default="").rstrip("/")
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+    # Verifies (and re-hashes on first login) the bcrypt hashes imported
+    # from Supabase as "bcrypt$<hash>".
+    "django.contrib.auth.hashers.BCryptPasswordHasher",
+]
 
-SUPABASE_JWT_ISSUER = env(
-    "SUPABASE_JWT_ISSUER",
-    default=f"{SUPABASE_URL}/auth/v1" if SUPABASE_URL else "",
-)
+JWT_SIGNING_KEY = env("JWT_SIGNING_KEY", default="")
+if not JWT_SIGNING_KEY:
+    if DEBUG:
+        JWT_SIGNING_KEY = "dev-only-" + SECRET_KEY
+    else:
+        raise ImproperlyConfigured(
+            "JWT_SIGNING_KEY es obligatoria cuando DEBUG=False."
+        )
 
-SUPABASE_JWT_AUDIENCE = env(
-    "SUPABASE_JWT_AUDIENCE",
-    default="authenticated",
-)
+JWT_ISSUER = "wms-cologistic"
+JWT_AUDIENCE = "wms"
 
-SUPABASE_JWT_ALGORITHMS = ["RS256", "ES256"]
+AUTH_ACCESS_TOKEN_MINUTES = 15
+AUTH_REFRESH_TOKEN_HOURS = 8
+AUTH_MAX_FAILED_ATTEMPTS = 5
+AUTH_LOCK_MINUTES = 15
 
-# Server-only key used exclusively for Supabase Auth administration. Prefer the
-# new sb_secret_* key; the legacy service_role JWT is accepted during migration.
-SUPABASE_SECRET_KEY = env("SUPABASE_SECRET_KEY", default="")
+AUTH_REFRESH_COOKIE_NAME = "wms_refresh"
+AUTH_REFRESH_COOKIE_PATH = "/api/auth/"
+AUTH_COOKIE_SECURE = env.bool("AUTH_COOKIE_SECURE", default=not DEBUG)
 
 
 
@@ -341,6 +363,10 @@ CORS_ALLOWED_ORIGINS = [
     for origin in env.list("CORS_ALLOWED_ORIGINS", default=_default_cors_origins)
     if origin.strip()
 ]
+
+# The refresh token travels in an HttpOnly cookie, so credentials must be
+# allowed; CORS_ALLOWED_ORIGINS must therefore list explicit origins.
+CORS_ALLOW_CREDENTIALS = True
 
 CSRF_TRUSTED_ORIGINS = [
     origin.strip().rstrip("/")

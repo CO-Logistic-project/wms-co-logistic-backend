@@ -67,7 +67,7 @@ class TechnicalObservabilityMiddleware:
                     ruta=request.path[:500],
                     estado_http=status_code,
                     duracion_ms=round(duration, 3),
-                    memoria_mb=round(memory_usage_mb(), 3),
+                    memoria_mb=memory_usage_mb(),
                     consultas_db=max(0, len(connection.queries) - initial_queries),
                     error=failure,
                 )
