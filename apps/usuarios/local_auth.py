@@ -81,16 +81,8 @@ def check_password_policy(raw, user=None, field="password"):
     email = getattr(user, "correo", "") or ""
     local_part = email.split("@")[0].lower()
 
-    validator_user = None
-    if user is not None:
-        validator_user = SimpleNamespace(
-            username=local_part,
-            first_name=getattr(user, "nombre", ""),
-            last_name=getattr(user, "apellido", ""),
-            email=email,
-        )
     try:
-        validate_password(raw, user=validator_user)
+        validate_password(raw, user=None)
     except DjangoValidationError as exc:
         errors.extend(exc.messages)
 
